@@ -1,15 +1,21 @@
-"""Cartesia STT ``behavior="transcribe_on_flush"`` — manual turn detection with Silero VAD.
+"""Cartesia STT transcribe on flush use-case: manual turn detection with Silero VAD.
 
-``transcribe_on_flush`` does not detect turns itself: it only emits a
-:attr:`~livekit.agents.stt.SpeechEventType.FINAL_TRANSCRIPT` when you call
-:meth:`~livekit.agents.stt.RecognizeStream.flush`. This example shows the common pattern of
-deciding turn boundaries yourself with a VAD: the same audio is pushed to a ``silero.VAD``
-stream and the STT stream, and every time the VAD reports
-:attr:`~livekit.agents.vad.VADEventType.END_OF_SPEECH` we call ``stt_stream.flush()`` to close
-out the turn and get its transcript.
+This example showcases advanced usage.
+If you're building your first voice agent, try examples/other/cartesia.py
 
-Note: this is *not* how ``AgentSession`` works. The session never calls ``flush()`` (it
-finalizes turn-detecting STTs via model events, or by pushing silence for manual commits), so
+When configured to "transcribe_on_flush", Cartesia STT only emits a
+:attr:`~livekit.agents.stt.SpeechEventType.FINAL_TRANSCRIPT` when *you* call
+:meth:`~livekit.agents.stt.RecognizeStream.flush`.
+
+It never emits ``START_OF_SPEECH`` / ``END_OF_SPEECH``.
+
+This example shows how you can decide turn boundaries yourself with your own VAD:
+
+1. The same audio is pushed to a ``silero.VAD`` stream and the STT stream
+2. Every time the VAD reports :attr:`~livekit.agents.vad.VADEventType.END_OF_SPEECH`,
+    we call ``stt_stream.flush()`` to close out the turn and get its transcript.
+
+Note: this is *not* how ``AgentSession`` works. The session never calls ``flush()``, so
 ``transcribe_on_flush`` is meant for code that drives a ``RecognizeStream`` directly, like this.
 
 The audio is generated with ``cartesia.TTS`` so the example is self-contained. Several short
@@ -17,7 +23,7 @@ utterances are concatenated with silence gaps so the VAD sees distinct turns.
 
 Run with ``CARTESIA_API_KEY`` set:
 
-    python examples/other/cartesia_transcribe_on_flush_vad.py
+    uv run examples/other/cartesia_transcribe_on_flush_vad.py
 """
 
 from __future__ import annotations
@@ -31,8 +37,6 @@ from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import stt, utils, vad
 from livekit.plugins import cartesia, silero
-
-logger = logging.getLogger("cartesia-transcribe-on-flush-vad")
 
 UTTERANCES = [
     "What is the weather like today?",
@@ -85,6 +89,9 @@ async def build_timeline(tts: cartesia.TTS) -> list[rtc.AudioFrame]:
 
 async def main() -> None:
     load_dotenv()
+
+    logger = logging.getLogger("cartesia-transcribe-on-flush-vad")
+
     logging.basicConfig(level=logging.INFO)
 
     vad_model = silero.VAD.load(min_silence_duration=MIN_SILENCE_DURATION)
@@ -128,11 +135,10 @@ async def main() -> None:
             async for ev in stt_stream:
                 if ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT:
                     continue
-                text = ev.alternatives[0].text.strip()
-                if not text:
-                    continue  # ignore the empty final from the closing end_input() flush
+                if not ev.alternatives:
+                    continue
                 turn += 1
-                logger.info("turn %d transcript: %s", turn, text)
+                logger.info("turn %d transcript: %s", turn, ev.alternatives[0].text)
 
         try:
             await asyncio.gather(push_audio(), drive_flush_from_vad(), print_finals())

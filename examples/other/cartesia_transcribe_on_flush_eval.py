@@ -1,11 +1,16 @@
-"""Cartesia STT ``behavior="transcribe_on_flush"`` — offline eval / WER example.
+"""Cartesia STT transcribe on flush use-case: WER example.
 
-Unlike ``behavior="turn_detecting"`` (the default for ``ink-2``, which finalizes when the
-model detects the end of a turn), ``transcribe_on_flush`` only emits a
+If you're building your first voice agent, try examples/other/cartesia.py
+
+When configured to "transcribe_on_flush", Cartesia STT only emits a
 :attr:`~livekit.agents.stt.SpeechEventType.FINAL_TRANSCRIPT` when *you* call
-:meth:`~livekit.agents.stt.RecognizeStream.flush`. It never emits ``START_OF_SPEECH`` /
-``END_OF_SPEECH``. That makes it a good fit for offline evaluation: you push known audio,
-call ``flush()`` at the segment boundaries you control, and score the final transcripts.
+:meth:`~livekit.agents.stt.RecognizeStream.flush`.
+
+It never emits ``START_OF_SPEECH`` / ``END_OF_SPEECH``.
+
+That makes it a good fit for offline evaluation:
+you push known audio, call ``flush()`` at the segment boundaries you control,
+and score the final transcripts.
 
 This script is fully self-contained: it synthesizes the reference audio with
 ``cartesia.TTS`` (so the TTS input text doubles as the WER reference), feeds it to
@@ -14,7 +19,7 @@ word error rate.
 
 Run with ``CARTESIA_API_KEY`` set:
 
-    python examples/other/cartesia_transcribe_on_flush_eval.py
+    uv run examples/other/cartesia_transcribe_on_flush_eval.py
 """
 
 from __future__ import annotations
@@ -30,13 +35,11 @@ from livekit import rtc
 from livekit.agents import stt
 from livekit.plugins import cartesia
 
-logger = logging.getLogger("cartesia-transcribe-on-flush-eval")
-
 # Each entry is flushed as its own segment. In a real eval these would be utterances
 # from your dataset, each paired with a ground-truth transcript.
 REFERENCE_SEGMENTS = [
     "The quick brown fox jumps over the lazy dog.",
-    "Cartesia ink two transcribes speech with low latency.",
+    " Cartesia STT transcribes speech with low latency.",
 ]
 
 
@@ -70,7 +73,9 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return prev_row[len(hyp)] / len(ref)
 
 
-async def transcribe_segment(stream: stt.RecognizeStream, audio: rtc.AudioFrame) -> str:
+async def transcribe_segment(
+    logger: logging.Logger, stream: stt.RecognizeStream, audio: rtc.AudioFrame
+) -> str:
     """Push one segment, flush, and return the resulting final transcript."""
     stream.push_frame(audio)
     # transcribe_on_flush emits exactly one FINAL_TRANSCRIPT per flush().
@@ -85,9 +90,11 @@ async def transcribe_segment(stream: stt.RecognizeStream, audio: rtc.AudioFrame)
 
 async def main() -> None:
     load_dotenv()
+
+    logger = logging.getLogger("cartesia-transcribe-on-flush-eval")
+
     logging.basicConfig(level=logging.INFO)
 
-    # A standalone script has no agent http context, so share one explicit session.
     async with aiohttp.ClientSession() as http_session:
         tts = cartesia.TTS(model="sonic-3.5", http_session=http_session)
         speech_to_text = cartesia.STT(
@@ -103,14 +110,16 @@ async def main() -> None:
                 # Generate the reference audio with TTS so the example needs no audio file.
                 audio = await tts.synthesize(segment_text).collect()
                 # RecognizeStream.push_frame resamples to the STT sample rate automatically.
-                hypothesis = await transcribe_segment(stream, audio)
+                hypothesis = await transcribe_segment(logger, stream, audio)
                 logger.info("segment final: %s", hypothesis)
                 hypotheses.append(hypothesis)
         finally:
             await stream.aclose()
 
-    reference = " ".join(REFERENCE_SEGMENTS)
-    hypothesis = " ".join(hypotheses)
+    # do not add or remove spaces when joining!
+    # Cartesia's API expects transcript chunks to be joined with no extra formatting
+    reference = "".join(REFERENCE_SEGMENTS)
+    hypothesis = "".join(hypotheses)
     logger.info("reference:  %s", reference)
     logger.info("hypothesis: %s", hypothesis)
     logger.info("WER: %.2f%%", word_error_rate(reference, hypothesis) * 100)
