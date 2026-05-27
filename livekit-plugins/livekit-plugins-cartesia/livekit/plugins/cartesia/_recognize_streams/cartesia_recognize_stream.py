@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from livekit.agents import (
     stt,
 )
-from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit.agents.types import NOT_GIVEN
 
 from ..models import STTLanguages
 
