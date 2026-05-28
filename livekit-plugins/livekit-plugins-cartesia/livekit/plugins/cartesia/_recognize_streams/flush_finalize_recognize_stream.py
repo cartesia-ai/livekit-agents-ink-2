@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
@@ -53,14 +54,38 @@ def _get_api_language_param_from_language_code(language_code: LanguageCode) -> s
     return language_code.language
 
 
-class LegacyRecognizeStream(CartesiaRecognizeStream):
-    """Cartesia STT stream implementation for ``ink-whisper`` when the ``final_transcript_mode`` kwarg is omitted.
+@dataclass
+class _TranscriptBuffer:
+    text: list[str]
+    start_time: float
+    words: list[TimedString] | None = None
+    """None indicates that the API never returned the "word" property.
+
+    This is more strict that empty arrays since
+    it indicates that the model doesn't support words vs there are no words.
+    """
+
+
+class FlushFinalizeRecognizeStream(CartesiaRecognizeStream):
+    """Cartesia STT stream implementation for ``cartesia.STT(final_transcript_mode="emit_on_flush")``.
+
+    This implementation only emits :class:`~stt.SpeechEventType.FINAL_TRANSCRIPT`
+    after you call :meth:`flush`.
+    Until then, this emits :class:`~stt.SpeechEventType.INTERIM_TRANSCRIPT`.
+
+    This does not emit :class:`~stt.SpeechEventType.START_OF_SPEECH`
+    or :class:`~stt.SpeechEventType.END_OF_SPEECH`.
+
+    You should use ``cartesia.STT(final_transcript_mode="emit_on_flush")``
+    if your code knows when it needs :class:`~stt.SpeechEventType.FINAL_TRANSCRIPT`
+    to be emitted by Cartesia STT.
+
+    Use ``cartesia.STT(final_transcript_mode="auto")`` instead
+    if you do not know when the user is done speaking.
 
     See also:
-        https://docs.cartesia.ai/api-reference/stt/stt
-
-    .. deprecated::
-        Use ``cartesia.STT(final_transcript_mode="auto")`` or ``cartesia.STT(final_transcript_mode="emit_on_flush")`` instead.
+        - [API Reference](https://docs.cartesia.ai/api-reference/stt/stt)
+        - [Compare STT Endpoints](https://docs.cartesia.ai/use-the-api/compare-stt-endpoints)
     """
 
     def __init__(
@@ -88,19 +113,37 @@ class LegacyRecognizeStream(CartesiaRecognizeStream):
         self._language = language
         self._request_id = ""
         self._reconnect_event = asyncio.Event()
-        self._speaking = False
+
+        # input audio duration for usage recognition
         self._speech_duration: float = 0
+
+        # buffered parts waiting to be flushed
+        self._transcript_buffer: _TranscriptBuffer | None = None
+
+        # the last word timestamp we've seen
         self._last_speech_end_time: float = 0
+
+    def _send_recognition_usage_event(self) -> None:
+        if self._speech_duration > 0 and not self._event_ch.closed:
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.RECOGNITION_USAGE,
+                    request_id=self._request_id,
+                    recognition_usage=stt.RecognitionUsage(
+                        audio_duration=self._speech_duration,
+                    ),
+                )
+            )
+            self._speech_duration = 0
 
     async def _run(self) -> None:
         if self._input_ch.closed:
             return
 
         closing_ws = False
-        # Reset per-connection state so a transport-error retry (a new _run
-        # invocation by the base class) starts fresh.
-        self._speaking = False
+        # Reset per-connection state so a transport-error retry starts fresh.
         self._speech_duration = 0
+        self._transcript_buffer = None
         self._last_speech_end_time = 0
 
         async def keepalive_task(ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -123,19 +166,16 @@ class LegacyRecognizeStream(CartesiaRecognizeStream):
             )
 
             async for data in self._input_ch:
-                frames: list[rtc.AudioFrame | LegacyRecognizeStream._FlushSentinel] = []
+                frames: list[rtc.AudioFrame | FlushFinalizeRecognizeStream._FlushSentinel] = []
                 if isinstance(data, rtc.AudioFrame):
                     frames.extend(audio_bstream.write(data.data.tobytes()))
                 elif isinstance(data, self._FlushSentinel):
                     frames.extend(audio_bstream.flush())
                     frames.append(data)
-                    if not self._input_ch.closed:
-                        logger.warning(
-                            'Cartesia STT now has better support for stream.flush(). Try it out by using cartesia.STT(final_transcript_mode="emit_on_flush"). This will cause final transcripts to be emitted whenever stream.flush() is called rather than emitting partial transcripts as they come.'
-                        )
 
                 for frame in frames:
                     if isinstance(frame, self._FlushSentinel):
+                        self._send_recognition_usage_event()
                         await ws.send_str("finalize")
                     else:
                         self._speech_duration += frame.duration
@@ -145,6 +185,7 @@ class LegacyRecognizeStream(CartesiaRecognizeStream):
                 self._speech_duration += frame.duration
                 await ws.send_bytes(frame.data.tobytes())
 
+            self._send_recognition_usage_event()
             closing_ws = True
             await ws.send_str("close")
 
@@ -254,6 +295,20 @@ class LegacyRecognizeStream(CartesiaRecognizeStream):
             raise APIConnectionError("failed to connect to cartesia") from e
         return ws
 
+    def _get_buffered_speech_data(self) -> stt.SpeechData:
+        if self._transcript_buffer is None:
+            return stt.SpeechData(
+                language=self._language or LanguageCode("en"),
+                text="",
+            )
+        return stt.SpeechData(
+            language=self._language or LanguageCode("en"),
+            start_time=self._transcript_buffer.start_time,
+            end_time=self._last_speech_end_time,
+            text="".join(self._transcript_buffer.text),
+            words=self._transcript_buffer.words,
+        )
+
     def _process_stream_event(self, data: STTEventMessage) -> None:
         """Process incoming WebSocket messages.
 
@@ -263,82 +318,59 @@ class LegacyRecognizeStream(CartesiaRecognizeStream):
             self._request_id = request_id
 
         if data["type"] == "transcript":
-            if self._event_ch.closed:
-                return
-
-            text = data["text"]
-            words = data.get("words", [])
-            timed_words: list[TimedString] = [
-                TimedString(
-                    text=word.get("word", ""),
-                    start_time=word.get("start", 0) + self.start_time_offset,
-                    end_time=word.get("end", 0) + self.start_time_offset,
-                    start_time_offset=self.start_time_offset,
-                )
-                for word in words
-            ]
             # word timestamps are often within the audio window, so we track time separately
             if self._last_speech_end_time == 0.0:
                 self._last_speech_end_time = self.start_time_offset
-            start_time = self._last_speech_end_time
-            end_time = start_time + data.get("duration", 0)
-            self._last_speech_end_time = end_time
-            is_final = data["is_final"]
 
-            if not text and not is_final:
+            if not data["is_final"]:
                 return
 
-            # we don't have a super accurate way of detecting when speech started.
-            # this is typically the job of the VAD, but perfoming it here just in case something's
-            # relying on STT to perform this task.
-            if not self._speaking:
-                self._speaking = True
-                start_event = stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
-                self._event_ch.send_nowait(start_event)
+            # track time
+            start_time = self._last_speech_end_time
+            self._last_speech_end_time += data.get("duration", 0)
 
-            speech_data = stt.SpeechData(
-                language=self._language or LanguageCode("en"),
-                start_time=start_time,
-                end_time=end_time,
-                text=text,
-                words=timed_words,
-            )
-
-            if is_final:
-                if self._speech_duration > 0:
-                    self._event_ch.send_nowait(
-                        stt.SpeechEvent(
-                            type=stt.SpeechEventType.RECOGNITION_USAGE,
-                            request_id=self._request_id,
-                            recognition_usage=stt.RecognitionUsage(
-                                audio_duration=self._speech_duration,
-                            ),
-                        )
-                    )
-                    self._speech_duration = 0
-
-                event = stt.SpeechEvent(
-                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                    request_id=self._request_id,
-                    alternatives=[speech_data],
+            # append text
+            # track buffer start time if this was the first transcript event
+            if self._transcript_buffer is None:
+                self._transcript_buffer = _TranscriptBuffer(
+                    text=[data["text"]], start_time=start_time
                 )
-                self._event_ch.send_nowait(event)
-
-                if self._speaking:
-                    self._speaking = False
-                    end_event = stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
-                    self._event_ch.send_nowait(end_event)
             else:
-                event = stt.SpeechEvent(
-                    type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                    request_id=self._request_id,
-                    alternatives=[speech_data],
+                self._transcript_buffer.text.append(data["text"])
+
+            # append words
+            words = data.get("words", None)
+            if words is not None:
+                if self._transcript_buffer.words is None:
+                    self._transcript_buffer.words = []
+                self._transcript_buffer.words.extend(
+                    TimedString(
+                        text=word.get("word", ""),
+                        start_time=word.get("start", 0) + self.start_time_offset,
+                        end_time=word.get("end", 0) + self.start_time_offset,
+                        start_time_offset=self.start_time_offset,
+                    )
+                    for word in words
                 )
-                self._event_ch.send_nowait(event)
 
+            if not self._event_ch.closed:
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                        request_id=self._request_id,
+                        alternatives=[self._get_buffered_speech_data()],
+                    )
+                )
         elif data["type"] == "flush_done":
-            logger.debug("Received flush_done acknowledgment from Cartesia STT")
-
+            if not self._event_ch.closed:
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        request_id=self._request_id,
+                        alternatives=[self._get_buffered_speech_data()],
+                    )
+                )
+            self._transcript_buffer = None
         elif data["type"] == "done":
             logger.debug("Received done acknowledgment from Cartesia STT - session closing")
 
